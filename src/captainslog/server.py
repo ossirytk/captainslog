@@ -1,6 +1,6 @@
 """Captain's Log MCP server — capture and agenda tools."""
 
-from datetime import date
+from datetime import UTC, datetime
 from typing import Literal
 
 from fastmcp import FastMCP
@@ -55,7 +55,7 @@ def agenda(target_date: str = "") -> list[dict]:
     Args:
         target_date: Date to use as 'today' in YYYY-MM-DD format. Defaults to today.
     """
-    today = target_date or date.today().isoformat()
+    today = target_date or datetime.now(tz=UTC).date().isoformat()
     with get_connection() as conn:
         rows = conn.execute(
             """
@@ -119,17 +119,16 @@ def list_entries(
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     params.append(limit)
 
+    query = f"""
+        SELECT id, title, status, priority, category, due_date, created_at
+        FROM entries
+        {where}
+        ORDER BY created_at DESC
+        LIMIT ?
+        """  # noqa: S608 — where clause is built from validated field names, not user input
+
     with get_connection() as conn:
-        rows = conn.execute(
-            f"""
-            SELECT id, title, status, priority, category, due_date, created_at
-            FROM entries
-            {where}
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            params,
-        ).fetchall()
+        rows = conn.execute(query, params).fetchall()
     return [dict(row) for row in rows]
 
 
