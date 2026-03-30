@@ -183,3 +183,39 @@ uv python pin 3.13
 - Verify with `uv run ruff check .` (should be clean)
 - Keep diffs minimal and focused on the change
 - Do not include unrelated reformatting in commits
+
+---
+
+## 6. Improvements
+
+Potential features and enhancements, grouped by what they require.
+Mark ideas here rather than opening issues for every passing thought.
+
+### No additional dependencies (pure Python)
+
+- **Org-mode export** — `sync_to_org` tool writes `~/.captainslog/captainslog.org`
+  with proper org syntax: `TODO`/`DONE` states, `DEADLINE:` timestamps, tag drawers.
+  SQLite remains the source of truth; the org file is a read-friendly export.
+- **Markdown export** — similar export for non-org editors.
+- **Recurrence** — repeat field on entries (daily, weekly) with auto-reschedule on complete.
+- **Weekly review tool** — returns a summary of completed vs. overdue vs. new entries
+  for a given week range.
+
+### Requires optional CLI tools
+
+These enhancements depend on tools that may not be present on all systems.
+Check with `Get-Command <tool>` before implementing; degrade gracefully if absent.
+
+| Tool | Enhancement |
+|------|-------------|
+| `rg` | Full-text search across exported org/markdown files (`search` tool) |
+| `fzf` | Interactive task selection — only when user explicitly requests interactive mode |
+| `jq` | Structured output transformation for piping captainslog output into other tools |
+
+### Org-mode interop notes
+
+- NvChad (nvim-orgmode) and Emacs org-mode can both consume standard `.org` files
+- Org `CATEGORY` property maps naturally to the `category` field
+- Org priorities `[#A]` / `[#B]` / `[#C]` map to `high` / `normal` / `low`
+- A round-trip import (`import_from_org`) is a stretch goal — org parsing is fragile
+
