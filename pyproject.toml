@@ -1,0 +1,25 @@
+[project]
+name = "captainslog"
+version = "0.1.0"
+description = "Personal task capture and agenda MCP server"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=3.1.1",
+]
+
+[project.scripts]
+captainslog = "captainslog.server:run"
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/captainslog"]
+
+[tool.ruff]
+line-length = 120
