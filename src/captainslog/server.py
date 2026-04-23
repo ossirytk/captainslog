@@ -2,13 +2,15 @@
 
 import calendar
 import re
+import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
 from fastmcp import FastMCP
 
-from captainslog.db import FTS5_AVAILABLE, get_connection, init_db
+from captainslog import db
+from captainslog.db import get_connection, init_db
 
 mcp = FastMCP(
     name="captainslog",
@@ -94,6 +96,9 @@ def capture(  # noqa: PLR0913
         recurrence: Optional repeat cadence — daily, weekly, or monthly.
                     Requires due_date to be set for auto-reschedule on complete.
     """
+    if recurrence and not due_date:
+        return "Recurrence requires due_date in YYYY-MM-DD format."
+
     with get_connection() as conn:
         cursor = conn.execute(
             """
@@ -146,11 +151,13 @@ def complete(entry_id: int) -> str:
     """
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT title, body, priority, category, due_date, recurrence FROM entries WHERE id = ?",
+            "SELECT title, body, priority, category, due_date, recurrence, status FROM entries WHERE id = ?",
             (entry_id,),
         ).fetchone()
         if row is None:
             return f"No entry found with id {entry_id}."
+        if row["status"] == "done":
+            return f"Entry #{entry_id} is already marked as done."
 
         cursor = conn.execute(
             "UPDATE entries SET status = 'done', updated_at = datetime('now') WHERE id = ?",
@@ -241,29 +248,32 @@ def list_entries(  # noqa: PLR0913
 @mcp.tool
 def update_entry(  # noqa: PLR0913
     entry_id: int,
-    title: str = "",
-    body: str = "",
-    priority: Literal["low", "normal", "high", ""] = "",
-    category: str = "",
-    due_date: str = "",
-    recurrence: Literal["daily", "weekly", "monthly", "none", ""] = "",
-    status: Literal["todo", "in_progress", "done", "cancelled", ""] = "",
+    title: str | None = None,
+    body: str | None = None,
+    priority: Literal["low", "normal", "high"] | None = None,
+    category: str | None = None,
+    due_date: str | None = None,
+    recurrence: Literal["daily", "weekly", "monthly"] | None = None,
+    *,
+    clear_body: bool = False,
+    clear_due_date: bool = False,
+    clear_recurrence: bool = False,
+    status: Literal["todo", "in_progress", "done", "cancelled"] | None = None,
 ) -> str:
-    """Update fields on an existing entry. Only provided (non-empty) fields are changed.
-
-    Pass body='none' to clear the body text.
-    Pass recurrence='none' to clear an existing recurrence.
-    Pass due_date='none' to clear an existing due date.
+    """Update fields on an existing entry. Omitted/empty-string fields are left unchanged.
 
     Args:
         entry_id: The numeric ID of the entry to update.
-        title: New title, or empty to leave unchanged.
-        body: New body text, 'none' to clear, or empty to leave unchanged.
-        priority: New priority, or empty to leave unchanged.
-        category: New category, or empty to leave unchanged.
-        due_date: New due date (YYYY-MM-DD), 'none' to clear, or empty to leave unchanged.
-        recurrence: New recurrence cadence, 'none' to clear, or empty to leave unchanged.
-        status: New status, or empty to leave unchanged.
+        title: New title, or omitted/empty to leave unchanged.
+        body: New body text, or omitted/empty to leave unchanged.
+        priority: New priority, or omitted/empty to leave unchanged.
+        category: New category, or omitted/empty to leave unchanged.
+        due_date: New due date (YYYY-MM-DD), or omitted/empty to leave unchanged.
+        recurrence: New recurrence cadence, or omitted/empty to leave unchanged.
+        clear_body: Set true to clear body text.
+        clear_due_date: Set true to clear due date.
+        clear_recurrence: Set true to clear recurrence.
+        status: New status, or omitted/empty to leave unchanged.
     """
     with get_connection() as conn:
         if conn.execute("SELECT 1 FROM entries WHERE id = ?", (entry_id,)).fetchone() is None:
@@ -275,7 +285,7 @@ def update_entry(  # noqa: PLR0913
         if title:
             fields.append("title = ?")
             params.append(title)
-        if body == "none":
+        if clear_body:
             fields.append("body = NULL")
         elif body:
             fields.append("body = ?")
@@ -286,12 +296,12 @@ def update_entry(  # noqa: PLR0913
         if category:
             fields.append("category = ?")
             params.append(category)
-        if due_date == "none":
+        if clear_due_date:
             fields.append("due_date = NULL")
         elif due_date:
             fields.append("due_date = ?")
             params.append(due_date)
-        if recurrence == "none":
+        if clear_recurrence:
             fields.append("recurrence = NULL")
         elif recurrence:
             fields.append("recurrence = ?")
@@ -301,7 +311,7 @@ def update_entry(  # noqa: PLR0913
             params.append(status)
 
         if not fields:
-            return "No fields to update — provide at least one non-empty argument."
+            return "No fields to update — provide at least one update or clear_* flag."
 
         fields.append("updated_at = datetime('now')")
         params.append(entry_id)
@@ -338,7 +348,7 @@ def search(query: str, limit: int = 20) -> list[dict]:
         limit: Maximum number of results to return.
     """
     with get_connection() as conn:
-        if FTS5_AVAILABLE:
+        if db.FTS5_AVAILABLE:
             try:
                 rows = conn.execute(
                     """
@@ -348,12 +358,18 @@ def search(query: str, limit: int = 20) -> list[dict]:
                     FROM entries_fts
                     JOIN entries e ON entries_fts.rowid = e.id
                     WHERE entries_fts MATCH ?
-                    ORDER BY rank
+                    ORDER BY bm25(entries_fts)
                     LIMIT ?
                     """,
                     (query, limit),
                 ).fetchall()
-            except Exception:
+            except sqlite3.OperationalError as exc:
+                error_text = str(exc).lower()
+                if "fts5: syntax error" in error_text:
+                    msg = f"Invalid full-text query syntax: {query!r}"
+                    raise ValueError(msg) from exc
+                rows = []
+            except sqlite3.DatabaseError:
                 rows = []
         else:
             rows = []
@@ -538,6 +554,10 @@ def capture_many(entries: list[dict]) -> list[str]:
             if recurrence and recurrence not in ("daily", "weekly", "monthly"):
                 results.append(f"Skipped {title!r}: invalid recurrence {recurrence!r}. Use daily, weekly, or monthly.")
                 continue
+            due_date = item.get("due_date") or None
+            if recurrence and not due_date:
+                results.append(f"Skipped {title!r}: recurrence requires due_date.")
+                continue
             cursor = conn.execute(
                 """
                 INSERT INTO entries (title, body, priority, category, due_date, recurrence)
@@ -548,7 +568,7 @@ def capture_many(entries: list[dict]) -> list[str]:
                     item.get("body") or None,
                     item.get("priority") or "normal",
                     item.get("category") or "inbox",
-                    item.get("due_date") or None,
+                    due_date,
                     recurrence,
                 ),
             )
@@ -569,11 +589,14 @@ def complete_many(entry_ids: list[int]) -> list[str]:
     with get_connection() as conn:
         for entry_id in entry_ids:
             row = conn.execute(
-                "SELECT title, body, priority, category, due_date, recurrence FROM entries WHERE id = ?",
+                "SELECT title, body, priority, category, due_date, recurrence, status FROM entries WHERE id = ?",
                 (entry_id,),
             ).fetchone()
             if row is None:
                 results.append(f"No entry found with id {entry_id}.")
+                continue
+            if row["status"] == "done":
+                results.append(f"Entry #{entry_id} is already marked as done.")
                 continue
 
             conn.execute(
