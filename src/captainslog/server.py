@@ -112,7 +112,6 @@ def agenda(target_date: str = "") -> list[dict]:
 
     Args:
         target_date: Date to use as 'today' in YYYY-MM-DD format. Defaults to today (local time).
-        category: Filter to a specific category. Empty means all categories.
     """
     today = target_date or date.today().isoformat()  # noqa: DTZ011
     with get_connection() as conn:
@@ -252,13 +251,14 @@ def update_entry(  # noqa: PLR0913
 ) -> str:
     """Update fields on an existing entry. Only provided (non-empty) fields are changed.
 
+    Pass body='none' to clear the body text.
     Pass recurrence='none' to clear an existing recurrence.
     Pass due_date='none' to clear an existing due date.
 
     Args:
         entry_id: The numeric ID of the entry to update.
         title: New title, or empty to leave unchanged.
-        body: New body text, or empty to leave unchanged.
+        body: New body text, 'none' to clear, or empty to leave unchanged.
         priority: New priority, or empty to leave unchanged.
         category: New category, or empty to leave unchanged.
         due_date: New due date (YYYY-MM-DD), 'none' to clear, or empty to leave unchanged.
@@ -275,7 +275,9 @@ def update_entry(  # noqa: PLR0913
         if title:
             fields.append("title = ?")
             params.append(title)
-        if body:
+        if body == "none":
+            fields.append("body = NULL")
+        elif body:
             fields.append("body = ?")
             params.append(body)
         if priority:
@@ -337,20 +339,25 @@ def search(query: str, limit: int = 20) -> list[dict]:
     """
     with get_connection() as conn:
         if FTS5_AVAILABLE:
-            rows = conn.execute(
-                """
-                SELECT e.id, e.title, e.body, e.status, e.priority, e.category,
-                       e.due_date, e.recurrence, e.created_at,
-                       snippet(entries_fts, 0, '**', '**', '...', 12) AS snippet
-                FROM entries_fts
-                JOIN entries e ON entries_fts.rowid = e.id
-                WHERE entries_fts MATCH ?
-                ORDER BY rank
-                LIMIT ?
-                """,
-                (query, limit),
-            ).fetchall()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT e.id, e.title, e.body, e.status, e.priority, e.category,
+                           e.due_date, e.recurrence, e.created_at,
+                           snippet(entries_fts, 0, '**', '**', '...', 12) AS snippet
+                    FROM entries_fts
+                    JOIN entries e ON entries_fts.rowid = e.id
+                    WHERE entries_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    (query, limit),
+                ).fetchall()
+            except Exception:
+                rows = []
         else:
+            rows = []
+        if not rows:
             pattern = f"%{query}%"
             rows = conn.execute(
                 """
@@ -527,6 +534,10 @@ def capture_many(entries: list[dict]) -> list[str]:
             if not title:
                 results.append("Skipped entry with empty title.")
                 continue
+            recurrence = item.get("recurrence") or None
+            if recurrence and recurrence not in ("daily", "weekly", "monthly"):
+                results.append(f"Skipped {title!r}: invalid recurrence {recurrence!r}. Use daily, weekly, or monthly.")
+                continue
             cursor = conn.execute(
                 """
                 INSERT INTO entries (title, body, priority, category, due_date, recurrence)
@@ -538,7 +549,7 @@ def capture_many(entries: list[dict]) -> list[str]:
                     item.get("priority") or "normal",
                     item.get("category") or "inbox",
                     item.get("due_date") or None,
-                    item.get("recurrence") or None,
+                    recurrence,
                 ),
             )
             results.append(f"Logged entry #{cursor.lastrowid}: {title!r}")
@@ -610,6 +621,9 @@ def delete_many(entry_ids: list[int]) -> str:
         msg += f" {not_found} ID(s) not found."
     return msg
 
+
+@mcp.tool
+def sync_to_org() -> str:
     """Export all entries to ~/.captainslog/captainslog.org in org-mode format.
 
     The org file is a read-friendly export. SQLite remains the source of truth.
