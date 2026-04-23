@@ -19,6 +19,8 @@ mcp = FastMCP(
         "Use `complete` to mark tasks done. "
         "Use `list_entries` to browse or filter the backlog. "
         "Use `search` to find entries by keyword. "
+        "Use `update_entry` to edit an existing entry. "
+        "Use `delete_entry` to permanently remove an entry. "
         "Use `weekly_review` to summarise a week's activity. "
         "Use `sync_to_org` or `sync_to_markdown` to export the log."
     ),
@@ -208,6 +210,91 @@ def list_entries(
     with get_connection() as conn:
         rows = conn.execute(query, params).fetchall()
     return [dict(row) for row in rows]
+
+
+@mcp.tool
+def update_entry(  # noqa: PLR0913
+    entry_id: int,
+    title: str = "",
+    body: str = "",
+    priority: Literal["low", "normal", "high", ""] = "",
+    category: str = "",
+    due_date: str = "",
+    recurrence: Literal["daily", "weekly", "monthly", "none", ""] = "",
+    status: Literal["todo", "in_progress", "done", "cancelled", ""] = "",
+) -> str:
+    """Update fields on an existing entry. Only provided (non-empty) fields are changed.
+
+    Pass recurrence='none' to clear an existing recurrence.
+    Pass due_date='none' to clear an existing due date.
+
+    Args:
+        entry_id: The numeric ID of the entry to update.
+        title: New title, or empty to leave unchanged.
+        body: New body text, or empty to leave unchanged.
+        priority: New priority, or empty to leave unchanged.
+        category: New category, or empty to leave unchanged.
+        due_date: New due date (YYYY-MM-DD), 'none' to clear, or empty to leave unchanged.
+        recurrence: New recurrence cadence, 'none' to clear, or empty to leave unchanged.
+        status: New status, or empty to leave unchanged.
+    """
+    with get_connection() as conn:
+        if conn.execute("SELECT 1 FROM entries WHERE id = ?", (entry_id,)).fetchone() is None:
+            return f"No entry found with id {entry_id}."
+
+        fields: list[str] = []
+        params: list = []
+
+        if title:
+            fields.append("title = ?")
+            params.append(title)
+        if body:
+            fields.append("body = ?")
+            params.append(body)
+        if priority:
+            fields.append("priority = ?")
+            params.append(priority)
+        if category:
+            fields.append("category = ?")
+            params.append(category)
+        if due_date == "none":
+            fields.append("due_date = NULL")
+        elif due_date:
+            fields.append("due_date = ?")
+            params.append(due_date)
+        if recurrence == "none":
+            fields.append("recurrence = NULL")
+        elif recurrence:
+            fields.append("recurrence = ?")
+            params.append(recurrence)
+        if status:
+            fields.append("status = ?")
+            params.append(status)
+
+        if not fields:
+            return "No fields to update — provide at least one non-empty argument."
+
+        fields.append("updated_at = datetime('now')")
+        params.append(entry_id)
+        conn.execute(
+            f"UPDATE entries SET {', '.join(fields)} WHERE id = ?",  # noqa: S608
+            params,
+        )
+    return f"Entry #{entry_id} updated."
+
+
+@mcp.tool
+def delete_entry(entry_id: int) -> str:
+    """Permanently delete an entry from the log.
+
+    Args:
+        entry_id: The numeric ID of the entry to delete.
+    """
+    with get_connection() as conn:
+        cursor = conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+    if cursor.rowcount == 0:
+        return f"No entry found with id {entry_id}."
+    return f"Entry #{entry_id} deleted."
 
 
 @mcp.tool
