@@ -29,9 +29,10 @@ def _init_fts(conn: sqlite3.Connection) -> bool:
     """Create FTS5 virtual table and sync triggers. Returns True if FTS5 is available."""
     global FTS5_AVAILABLE  # noqa: PLW0603
     try:
-        fts_exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'entries_fts'"
-        ).fetchone()
+        fts_exists = (
+            conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'entries_fts'").fetchone()
+            is not None
+        )
         conn.executescript("""
             CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
                 title, body,
@@ -55,7 +56,7 @@ def _init_fts(conn: sqlite3.Connection) -> bool:
             END;
         """)
         # Rebuild only when FTS is first created so existing rows are indexed once.
-        if fts_exists is None:
+        if not fts_exists:
             conn.execute("INSERT INTO entries_fts(entries_fts) VALUES ('rebuild')")
         conn.commit()
         FTS5_AVAILABLE = True

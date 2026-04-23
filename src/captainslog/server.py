@@ -10,7 +10,6 @@ from typing import Literal
 from fastmcp import FastMCP
 
 from captainslog import db
-from captainslog.db import get_connection, init_db
 
 mcp = FastMCP(
     name="captainslog",
@@ -37,6 +36,7 @@ mcp = FastMCP(
 
 _ORG_PRIORITY = {"high": "[#A]", "normal": "[#B]", "low": "[#C]"}
 _MD_PRIORITY = {"high": "`high`", "normal": "`normal`", "low": "`low`"}
+_FTS_SYNTAX_ERROR_PATTERNS = ("fts5: syntax error", "unterminated string", "malformed")
 
 
 def _compute_next_due(due_date_iso: str, recurrence: str) -> str:
@@ -99,7 +99,7 @@ def capture(  # noqa: PLR0913
     if recurrence and not due_date:
         return "Recurrence requires due_date in YYYY-MM-DD format."
 
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         cursor = conn.execute(
             """
             INSERT INTO entries (title, body, priority, category, due_date, recurrence)
@@ -119,7 +119,7 @@ def agenda(target_date: str = "") -> list[dict]:
         target_date: Date to use as 'today' in YYYY-MM-DD format. Defaults to today (local time).
     """
     today = target_date or date.today().isoformat()  # noqa: DTZ011
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         rows = conn.execute(
             """
             SELECT id, title, body, status, priority, category, due_date, recurrence, created_at
@@ -149,9 +149,9 @@ def complete(entry_id: int) -> str:
     Args:
         entry_id: The numeric ID of the entry to complete.
     """
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         row = conn.execute(
-            "SELECT title, body, priority, category, due_date, recurrence, status FROM entries WHERE id = ?",
+            "SELECT title, body, status, priority, category, due_date, recurrence FROM entries WHERE id = ?",
             (entry_id,),
         ).fetchone()
         if row is None:
@@ -240,7 +240,7 @@ def list_entries(  # noqa: PLR0913
         LIMIT ?
         """  # noqa: S608 — where clause is built from validated field names, not user input
 
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         rows = conn.execute(query, params).fetchall()
     return [dict(row) for row in rows]
 
@@ -275,7 +275,7 @@ def update_entry(  # noqa: PLR0913
         clear_recurrence: Set true to clear recurrence.
         status: New status, or omitted/empty to leave unchanged.
     """
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         if conn.execute("SELECT 1 FROM entries WHERE id = ?", (entry_id,)).fetchone() is None:
             return f"No entry found with id {entry_id}."
 
@@ -329,7 +329,7 @@ def delete_entry(entry_id: int) -> str:
     Args:
         entry_id: The numeric ID of the entry to delete.
     """
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         cursor = conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
     if cursor.rowcount == 0:
         return f"No entry found with id {entry_id}."
@@ -347,7 +347,7 @@ def search(query: str, limit: int = 20) -> list[dict]:
         query: Search term or phrase. Supports FTS5 match syntax (e.g. 'fix*', '"exact phrase"').
         limit: Maximum number of results to return.
     """
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         if db.FTS5_AVAILABLE:
             try:
                 rows = conn.execute(
@@ -358,6 +358,7 @@ def search(query: str, limit: int = 20) -> list[dict]:
                     FROM entries_fts
                     JOIN entries e ON entries_fts.rowid = e.id
                     WHERE entries_fts MATCH ?
+                    -- Lower bm25 score means a better match.
                     ORDER BY bm25(entries_fts)
                     LIMIT ?
                     """,
@@ -365,12 +366,10 @@ def search(query: str, limit: int = 20) -> list[dict]:
                 ).fetchall()
             except sqlite3.OperationalError as exc:
                 error_text = str(exc).lower()
-                if "fts5: syntax error" in error_text:
+                if any(term in error_text for term in _FTS_SYNTAX_ERROR_PATTERNS):
                     msg = f"Invalid full-text query syntax: {query!r}"
                     raise ValueError(msg) from exc
-                rows = []
-            except sqlite3.DatabaseError:
-                rows = []
+                raise
         else:
             rows = []
         if not rows:
@@ -407,7 +406,7 @@ def weekly_review(week_start: str = "") -> dict:
     start_iso = start.isoformat()
     end_iso = end.isoformat()
 
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         completed = conn.execute(
             """
             SELECT id, title, status, priority, category, due_date, recurrence, updated_at
@@ -458,7 +457,7 @@ def get_entry(entry_id: int) -> dict | str:
     Args:
         entry_id: The numeric ID of the entry to retrieve.
     """
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         row = conn.execute(
             """
             SELECT id, title, body, status, priority, category,
@@ -480,7 +479,7 @@ def list_categories() -> list[dict]:
     Returns a list of dicts with: category, total, open, done, cancelled.
     Sorted by number of open entries descending.
     """
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         rows = conn.execute(
             """
             SELECT
@@ -504,7 +503,7 @@ def stats() -> dict:
     Useful for a quick situational overview without loading all entries.
     """
     today = date.today().isoformat()  # noqa: DTZ011
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         by_status = {
             row["status"]: row["n"]
             for row in conn.execute("SELECT status, COUNT(*) AS n FROM entries GROUP BY status").fetchall()
@@ -544,7 +543,7 @@ def capture_many(entries: list[dict]) -> list[str]:
         entries: List of entry dicts. Each must have at least a 'title' key.
     """
     results: list[str] = []
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         for item in entries:
             title = item.get("title", "").strip()
             if not title:
@@ -586,10 +585,10 @@ def complete_many(entry_ids: list[int]) -> list[str]:
         entry_ids: List of entry IDs to mark as done.
     """
     results: list[str] = []
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         for entry_id in entry_ids:
             row = conn.execute(
-                "SELECT title, body, priority, category, due_date, recurrence, status FROM entries WHERE id = ?",
+                "SELECT title, body, status, priority, category, due_date, recurrence FROM entries WHERE id = ?",
                 (entry_id,),
             ).fetchone()
             if row is None:
@@ -632,7 +631,7 @@ def delete_many(entry_ids: list[int]) -> str:
     if not entry_ids:
         return "No IDs provided."
     placeholders = ", ".join("?" * len(entry_ids))
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         cursor = conn.execute(
             f"DELETE FROM entries WHERE id IN ({placeholders})",  # noqa: S608
             entry_ids,
@@ -653,7 +652,7 @@ def sync_to_org() -> str:
     Entries are grouped by category and sorted by priority then due date.
     Priority mapping: high → [#A], normal → [#B], low → [#C].
     """
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         rows = conn.execute(
             """
             SELECT id, title, body, status, priority, category, due_date, recurrence, updated_at
@@ -714,7 +713,7 @@ def sync_to_markdown() -> str:
     The Markdown file is a read-friendly export. SQLite remains the source of truth.
     Entries are grouped by category and sorted by priority then due date.
     """
-    with get_connection() as conn:
+    with db.get_connection() as conn:
         rows = conn.execute(
             """
             SELECT id, title, body, status, priority, category, due_date, recurrence, updated_at
@@ -757,7 +756,7 @@ def sync_to_markdown() -> str:
 
 
 def run() -> None:
-    init_db()
+    db.init_db()
     mcp.run()
 
 
