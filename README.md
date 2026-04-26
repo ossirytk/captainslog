@@ -102,7 +102,10 @@ Add the server to your Copilot CLI MCP config file.
 
 Add the server to your VS Code user or workspace MCP settings.
 
-**User-level** — create or edit `~/.config/Code/User/mcp.json` (Linux/macOS) or `%APPDATA%\Code\User\mcp.json` (Windows):
+**User-level** — create or edit:
+- Linux: `~/.config/Code/User/mcp.json`
+- macOS: `~/Library/Application Support/Code/User/mcp.json`
+- Windows: `%APPDATA%\Code\User\mcp.json`
 
 ```json
 {
