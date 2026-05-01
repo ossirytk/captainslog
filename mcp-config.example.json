@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "captainslog": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/captainslog", "captainslog"],
+      "tools": ["*"]
+    }
+  }
+}
