@@ -67,15 +67,13 @@ The server communicates over **stdio** (standard MCP transport). Register it in 
 
 Add the server to your Copilot CLI MCP config file.
 
-**Location:**
-- Linux / macOS: `~/.config/github-copilot/mcp.json`
-- Windows: `%APPDATA%\GitHub Copilot\mcp.json`
+**Location:** `~/.copilot/mcp-config.json`
 
 **Using the installed tool (Option A):**
 
 ```json
 {
-  "servers": {
+  "mcpServers": {
     "captainslog": {
       "type": "stdio",
       "command": "captainslog"
@@ -88,7 +86,7 @@ Add the server to your Copilot CLI MCP config file.
 
 ```json
 {
-  "servers": {
+  "mcpServers": {
     "captainslog": {
       "type": "stdio",
       "command": "uv",
