@@ -78,6 +78,53 @@ def _org_closed(iso_datetime: str) -> str:
         return f"[{iso_datetime[:10]}]"
 
 
+def _validate_and_dedupe_depends_on(
+    conn: sqlite3.Connection,
+    depends_on: list,
+    entry_id: int,
+) -> tuple[list[int], list[int]]:
+    """Deduplicate, validate and filter a raw depends_on list.
+
+    Returns ``(dep_ids, invalid_ids)`` where ``dep_ids`` is the cleaned list
+    of valid dependency IDs (excluding self-references) and ``invalid_ids``
+    contains any IDs that do not correspond to existing entries.
+    """
+    deduped = list(dict.fromkeys(d for d in depends_on if isinstance(d, int)))
+    if not deduped:
+        return [], []
+    placeholders = ",".join("?" * len(deduped))
+    valid_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT id FROM entries WHERE id IN ({placeholders})",  # noqa: S608
+            deduped,
+        ).fetchall()
+    }
+    invalid_ids = sorted(set(deduped) - valid_ids - {entry_id})
+    dep_ids = [d for d in deduped if d != entry_id and d in valid_ids]
+    return dep_ids, invalid_ids
+
+
+def _fetch_blocked_by_map(conn: sqlite3.Connection, entry_ids: list[int]) -> dict[int, list[int]]:
+    """Return a mapping of entry_id → list of active blocker IDs for a batch of entries."""
+    if not entry_ids:
+        return {}
+    id_placeholders = ",".join("?" * len(entry_ids))
+    blocked_by_map: dict[int, list[int]] = {}
+    for dr in conn.execute(
+        f"""
+        SELECT d.entry_id, d.depends_on_id
+        FROM entry_deps d
+        JOIN entries e ON e.id = d.depends_on_id
+        WHERE d.entry_id IN ({id_placeholders})
+          AND e.status NOT IN ('done', 'cancelled')
+        """,  # noqa: S608
+        entry_ids,
+    ).fetchall():
+        blocked_by_map.setdefault(dr[0], []).append(dr[1])
+    return blocked_by_map
+
+
 @mcp.tool
 def capture(  # noqa: PLR0913
     title: str,
@@ -113,19 +160,9 @@ def capture(  # noqa: PLR0913
         )
         entry_id = cursor.lastrowid
         if depends_on:
-            depends_on = list(dict.fromkeys(d for d in depends_on if isinstance(d, int)))
-            placeholders = ",".join("?" * len(depends_on))
-            valid_ids = {
-                row[0]
-                for row in conn.execute(
-                    f"SELECT id FROM entries WHERE id IN ({placeholders})",  # noqa: S608
-                    depends_on,
-                ).fetchall()
-            }
-            invalid_ids = sorted(set(depends_on) - valid_ids - {entry_id})
+            dep_ids, invalid_ids = _validate_and_dedupe_depends_on(conn, depends_on, entry_id)
             if invalid_ids:
                 return f"Entry #{entry_id} created. Invalid depends_on IDs (not set): {invalid_ids}."
-            dep_ids = [d for d in depends_on if d != entry_id]
             if dep_ids:
                 conn.executemany(
                     "INSERT INTO entry_deps (entry_id, depends_on_id) VALUES (?, ?)",
@@ -162,20 +199,7 @@ def agenda(target_date: str = "") -> list[dict]:
             {"today": today},
         ).fetchall()
         entry_ids = [row["id"] for row in rows]
-        blocked_by_map: dict[int, list[int]] = {}
-        if entry_ids:
-            id_placeholders = ",".join("?" * len(entry_ids))
-            for dr in conn.execute(
-                f"""
-                SELECT d.entry_id, d.depends_on_id
-                FROM entry_deps d
-                JOIN entries e ON e.id = d.depends_on_id
-                WHERE d.entry_id IN ({id_placeholders})
-                  AND e.status NOT IN ('done', 'cancelled')
-                """,  # noqa: S608
-                entry_ids,
-            ).fetchall():
-                blocked_by_map.setdefault(dr[0], []).append(dr[1])
+        blocked_by_map = _fetch_blocked_by_map(conn, entry_ids)
         result = []
         for row in rows:
             entry = dict(row)
@@ -297,20 +321,7 @@ def list_entries(  # noqa: PLR0913
     with db.get_connection() as conn:
         rows = conn.execute(query, params).fetchall()
         entry_ids = [row["id"] for row in rows]
-        blocked_by_map: dict[int, list[int]] = {}
-        if entry_ids:
-            id_placeholders = ",".join("?" * len(entry_ids))
-            for dr in conn.execute(
-                f"""
-                SELECT d.entry_id, d.depends_on_id
-                FROM entry_deps d
-                JOIN entries e ON e.id = d.depends_on_id
-                WHERE d.entry_id IN ({id_placeholders})
-                  AND e.status NOT IN ('done', 'cancelled')
-                """,  # noqa: S608
-                entry_ids,
-            ).fetchall():
-                blocked_by_map.setdefault(dr[0], []).append(dr[1])
+        blocked_by_map = _fetch_blocked_by_map(conn, entry_ids)
         result = []
         for row in rows:
             entry = dict(row)
@@ -320,7 +331,7 @@ def list_entries(  # noqa: PLR0913
 
 
 @mcp.tool
-def update_entry(  # noqa: PLR0913, PLR0912, PLR0915
+def update_entry(  # noqa: PLR0913, PLR0912
     entry_id: int,
     title: str | None = None,
     body: str | None = None,
@@ -395,20 +406,9 @@ def update_entry(  # noqa: PLR0913, PLR0912, PLR0915
         # Validate and prepare dep IDs before touching the database.
         dep_ids: list[int] = []
         if depends_on is not None:
-            depends_on = list(dict.fromkeys(d for d in depends_on if isinstance(d, int)))
-            if depends_on:
-                placeholders = ",".join("?" * len(depends_on))
-                valid_ids = {
-                    row[0]
-                    for row in conn.execute(
-                        f"SELECT id FROM entries WHERE id IN ({placeholders})",  # noqa: S608
-                        depends_on,
-                    ).fetchall()
-                }
-                invalid_ids = sorted(set(depends_on) - valid_ids - {entry_id})
-                if invalid_ids:
-                    return f"Invalid depends_on IDs: {invalid_ids}. Entry #{entry_id} not updated."
-                dep_ids = [d for d in depends_on if d != entry_id]
+            dep_ids, invalid_ids = _validate_and_dedupe_depends_on(conn, depends_on, entry_id)
+            if invalid_ids:
+                return f"Invalid depends_on IDs: {invalid_ids}. Entry #{entry_id} not updated."
 
         if fields:
             fields.append("updated_at = datetime('now')")
