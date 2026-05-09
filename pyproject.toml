@@ -3,7 +3,7 @@ name = "captainslog"
 version = "0.1.0"
 description = "Personal task capture and agenda MCP server"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "fastmcp>=3.1.1",
 ]
@@ -29,7 +29,7 @@ build-backend = "hatchling.build"
 packages = ["src/captainslog"]
 
 [tool.ruff]
-target-version = "py313"
+target-version = "py312"
 line-length = 120
 
 [tool.ruff.lint]

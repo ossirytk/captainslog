@@ -14,6 +14,7 @@ def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
@@ -22,6 +23,19 @@ def _migrate(conn: sqlite3.Connection) -> None:
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(entries)")}
     if "recurrence" not in existing_cols:
         conn.execute("ALTER TABLE entries ADD COLUMN recurrence TEXT")
+        conn.commit()
+
+    existing_tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "entry_deps" not in existing_tables:
+        conn.execute("""
+            CREATE TABLE entry_deps (
+                entry_id      INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+                depends_on_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+                PRIMARY KEY (entry_id, depends_on_id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_entry_deps_entry ON entry_deps(entry_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_entry_deps_dep   ON entry_deps(depends_on_id)")
         conn.commit()
 
 

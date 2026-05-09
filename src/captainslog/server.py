@@ -15,16 +15,18 @@ mcp = FastMCP(
     name="captainslog",
     instructions=(
         "Captain's Log is a personal task and agenda manager. "
-        "Use `capture` to log one task, or `capture_many` for several at once. "
-        "Use `agenda` to surface what needs attention today. "
+        "Use `capture` to log one task (supports depends_on), or `capture_many` for several at once. "
+        "Use `agenda` to surface what needs attention today (includes in_progress; shows blocked_by). "
         "Use `complete` to mark one task done, or `complete_many` for several. "
-        "Use `list_entries` to browse or filter the backlog (supports priority, date-range, and sort filters). "
-        "Use `get_entry` to read all fields of a single entry. "
-        "Use `update_entry` to edit an existing entry. "
+        "Use `list_entries` to browse or filter the backlog (priority, date-range, sort; shows blocked_by). "
+        "Use `get_entry` to read all fields of a single entry (includes depends_on and blocked_by). "
+        "Use `update_entry` to edit an existing entry (supports depends_on/clear_depends_on), "
+        "or `update_many` to bulk-update several entries at once. "
         "Use `delete_entry` to remove one entry, or `delete_many` for several. "
+        "Use `archive` to bulk-cancel or bulk-complete stale entries older than N days. "
         "Use `search` to find entries by keyword. "
         "Use `list_categories` to see all categories with open/done counts. "
-        "Use `stats` for a quick count summary by status and priority. "
+        "Use `stats` for a quick count summary by status and priority (includes currently_active count). "
         "Use `weekly_review` to summarise a week's activity. "
         "Use `sync_to_org` or `sync_to_markdown` to export the log."
     ),
@@ -84,6 +86,7 @@ def capture(  # noqa: PLR0913
     category: str = "inbox",
     due_date: str = "",
     recurrence: Literal["daily", "weekly", "monthly", ""] = "",
+    depends_on: list[int] | None = None,
 ) -> str:
     """Add a new task or note to the log.
 
@@ -95,6 +98,7 @@ def capture(  # noqa: PLR0913
         due_date: Optional due date in YYYY-MM-DD format.
         recurrence: Optional repeat cadence — daily, weekly, or monthly.
                     Requires due_date to be set for auto-reschedule on complete.
+        depends_on: Optional list of entry IDs this task depends on (will be blocked by them).
     """
     if recurrence and not due_date:
         return "Recurrence requires due_date in YYYY-MM-DD format."
@@ -108,6 +112,11 @@ def capture(  # noqa: PLR0913
             (title, body, priority, category, due_date or None, recurrence or None),
         )
         entry_id = cursor.lastrowid
+        if depends_on:
+            conn.executemany(
+                "INSERT OR IGNORE INTO entry_deps (entry_id, depends_on_id) VALUES (?, ?)",
+                [(entry_id, dep_id) for dep_id in depends_on],
+            )
     return f"Logged entry #{entry_id}: {title!r}"
 
 
@@ -126,17 +135,37 @@ def agenda(target_date: str = "") -> list[dict]:
             FROM entries
             WHERE status NOT IN ('done', 'cancelled')
               AND (
-                  due_date <= :today
+                  status = 'in_progress'
+                  OR due_date <= :today
                   OR priority = 'high'
               )
             ORDER BY
+                CASE status WHEN 'in_progress' THEN 0 ELSE 1 END,
                 CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
                 due_date NULLS LAST,
                 created_at
             """,
             {"today": today},
         ).fetchall()
-    return [dict(row) for row in rows]
+        result = []
+        for row in rows:
+            entry = dict(row)
+            blocked_by = [
+                r[0]
+                for r in conn.execute(
+                    """
+                    SELECT d.depends_on_id
+                    FROM entry_deps d
+                    JOIN entries e ON e.id = d.depends_on_id
+                    WHERE d.entry_id = ?
+                      AND e.status NOT IN ('done', 'cancelled')
+                    """,
+                    (entry["id"],),
+                ).fetchall()
+            ]
+            entry["blocked_by"] = blocked_by
+            result.append(entry)
+    return result
 
 
 @mcp.tool
@@ -145,6 +174,10 @@ def complete(entry_id: int) -> str:
 
     If the entry has a recurrence set and a due_date, a new entry is automatically
     created with the next due date so the series continues.
+
+    Note: if recurrence is set but no due_date is present, the next occurrence cannot
+    be auto-scheduled. Set a due_date on the entry before completing to enable
+    auto-scheduling.
 
     Args:
         entry_id: The numeric ID of the entry to complete.
@@ -179,6 +212,11 @@ def complete(entry_id: int) -> str:
             )
             new_id = new_cursor.lastrowid
             return f"Entry #{entry_id} marked as done. Next occurrence created as #{new_id} (due {next_due})."
+        if recurrence and not due_date:
+            return (
+                f"Entry #{entry_id} marked as done. "
+                "Note: recurrence is set but no due_date was present — next occurrence not scheduled."
+            )
 
     return f"Entry #{entry_id} marked as done."
 
@@ -242,11 +280,29 @@ def list_entries(  # noqa: PLR0913
 
     with db.get_connection() as conn:
         rows = conn.execute(query, params).fetchall()
-    return [dict(row) for row in rows]
+        result = []
+        for row in rows:
+            entry = dict(row)
+            blocked_by = [
+                r[0]
+                for r in conn.execute(
+                    """
+                    SELECT d.depends_on_id
+                    FROM entry_deps d
+                    JOIN entries e ON e.id = d.depends_on_id
+                    WHERE d.entry_id = ?
+                      AND e.status NOT IN ('done', 'cancelled')
+                    """,
+                    (entry["id"],),
+                ).fetchall()
+            ]
+            entry["blocked_by"] = blocked_by
+            result.append(entry)
+    return result
 
 
 @mcp.tool
-def update_entry(  # noqa: PLR0913
+def update_entry(  # noqa: PLR0913, PLR0912
     entry_id: int,
     title: str | None = None,
     body: str | None = None,
@@ -259,6 +315,8 @@ def update_entry(  # noqa: PLR0913
     clear_due_date: bool = False,
     clear_recurrence: bool = False,
     status: Literal["todo", "in_progress", "done", "cancelled"] | None = None,
+    depends_on: list[int] | None = None,
+    clear_depends_on: bool = False,
 ) -> str:
     """Update fields on an existing entry. Omitted/empty-string fields are left unchanged.
 
@@ -274,6 +332,8 @@ def update_entry(  # noqa: PLR0913
         clear_due_date: Set true to clear due date.
         clear_recurrence: Set true to clear recurrence.
         status: New status, or omitted/empty to leave unchanged.
+        depends_on: Replace the full set of dependency IDs for this entry.
+        clear_depends_on: Set true to remove all dependencies from this entry.
     """
     with db.get_connection() as conn:
         if conn.execute("SELECT 1 FROM entries WHERE id = ?", (entry_id,)).fetchone() is None:
@@ -310,15 +370,26 @@ def update_entry(  # noqa: PLR0913
             fields.append("status = ?")
             params.append(status)
 
-        if not fields:
+        dep_change = clear_depends_on or depends_on is not None
+        if not fields and not dep_change:
             return "No fields to update — provide at least one update or clear_* flag."
 
-        fields.append("updated_at = datetime('now')")
-        params.append(entry_id)
-        conn.execute(
-            f"UPDATE entries SET {', '.join(fields)} WHERE id = ?",  # noqa: S608
-            params,
-        )
+        if fields:
+            fields.append("updated_at = datetime('now')")
+            params.append(entry_id)
+            conn.execute(
+                f"UPDATE entries SET {', '.join(fields)} WHERE id = ?",  # noqa: S608
+                params,
+            )
+
+        if clear_depends_on or depends_on is not None:
+            conn.execute("DELETE FROM entry_deps WHERE entry_id = ?", (entry_id,))
+            if depends_on:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO entry_deps (entry_id, depends_on_id) VALUES (?, ?)",
+                    [(entry_id, dep_id) for dep_id in depends_on],
+                )
+
     return f"Entry #{entry_id} updated."
 
 
@@ -466,9 +537,27 @@ def get_entry(entry_id: int) -> dict | str:
             """,
             (entry_id,),
         ).fetchone()
-    if row is None:
-        return f"No entry found with id {entry_id}."
-    return dict(row)
+        if row is None:
+            return f"No entry found with id {entry_id}."
+        entry = dict(row)
+        entry["depends_on"] = [
+            r[0]
+            for r in conn.execute("SELECT depends_on_id FROM entry_deps WHERE entry_id = ?", (entry_id,)).fetchall()
+        ]
+        entry["blocked_by"] = [
+            r[0]
+            for r in conn.execute(
+                """
+                SELECT d.depends_on_id
+                FROM entry_deps d
+                JOIN entries e ON e.id = d.depends_on_id
+                WHERE d.entry_id = ?
+                  AND e.status NOT IN ('done', 'cancelled')
+                """,
+                (entry_id,),
+            ).fetchall()
+        ]
+    return entry
 
 
 @mcp.tool
@@ -526,6 +615,7 @@ def stats() -> dict:
     return {
         "total": sum(by_status.values()),
         "by_status": by_status,
+        "currently_active": by_status.get("in_progress", 0),
         "open_by_priority": by_priority,
         "overdue": overdue,
         "due_today": due_today,
@@ -579,7 +669,9 @@ def capture_many(entries: list[dict]) -> list[str]:
 def complete_many(entry_ids: list[int]) -> list[str]:
     """Mark multiple entries as done in a single operation.
 
-    Recurrence is handled per entry: if an entry recurs, the next occurrence is created.
+    Recurrence is handled per entry: if an entry recurs and has a due_date, the next
+    occurrence is created. If recurrence is set but no due_date is present, no next
+    occurrence can be scheduled and a warning is included in the result.
 
     Args:
         entry_ids: List of entry IDs to mark as done.
@@ -616,9 +708,125 @@ def complete_many(entry_ids: list[int]) -> list[str]:
                     f"Entry #{entry_id} marked as done. "
                     f"Next occurrence created as #{new_cur.lastrowid} (due {next_due})."
                 )
+            elif row["recurrence"] and not row["due_date"]:
+                results.append(
+                    f"Entry #{entry_id} marked as done. "
+                    "Note: recurrence is set but no due_date was present — next occurrence not scheduled."
+                )
             else:
                 results.append(f"Entry #{entry_id} marked as done.")
     return results
+
+
+@mcp.tool
+def update_many(entries: list[dict]) -> list[str]:  # noqa: PLR0912, PLR0915
+    """Update fields on multiple existing entries in a single operation.
+
+    Each entry dict must have at least an 'entry_id' key. All other fields are
+    optional and follow the same semantics as update_entry.
+
+    Args:
+        entries: List of dicts. Each must have 'entry_id' (int) plus any subset of:
+                 title, body, priority, category, due_date, recurrence, status,
+                 clear_body (bool), clear_due_date (bool), clear_recurrence (bool).
+    """
+    results: list[str] = []
+    with db.get_connection() as conn:
+        for item in entries:
+            entry_id = item.get("entry_id")
+            if not isinstance(entry_id, int):
+                results.append(f"Skipped entry with missing or invalid entry_id: {entry_id!r}")
+                continue
+            if conn.execute("SELECT 1 FROM entries WHERE id = ?", (entry_id,)).fetchone() is None:
+                results.append(f"No entry found with id {entry_id}.")
+                continue
+
+            fields: list[str] = []
+            params: list = []
+
+            title = item.get("title")
+            body = item.get("body")
+            priority = item.get("priority")
+            category = item.get("category")
+            due_date = item.get("due_date")
+            recurrence = item.get("recurrence")
+            status = item.get("status")
+            clear_body = bool(item.get("clear_body", False))
+            clear_due_date = bool(item.get("clear_due_date", False))
+            clear_recurrence = bool(item.get("clear_recurrence", False))
+
+            if title:
+                fields.append("title = ?")
+                params.append(title)
+            if clear_body:
+                fields.append("body = NULL")
+            elif body:
+                fields.append("body = ?")
+                params.append(body)
+            if priority:
+                fields.append("priority = ?")
+                params.append(priority)
+            if category:
+                fields.append("category = ?")
+                params.append(category)
+            if clear_due_date:
+                fields.append("due_date = NULL")
+            elif due_date:
+                fields.append("due_date = ?")
+                params.append(due_date)
+            if clear_recurrence:
+                fields.append("recurrence = NULL")
+            elif recurrence:
+                fields.append("recurrence = ?")
+                params.append(recurrence)
+            if status:
+                fields.append("status = ?")
+                params.append(status)
+
+            if not fields:
+                results.append(f"Entry #{entry_id}: no fields to update — skipped.")
+                continue
+
+            fields.append("updated_at = datetime('now')")
+            params.append(entry_id)
+            conn.execute(
+                f"UPDATE entries SET {', '.join(fields)} WHERE id = ?",  # noqa: S608
+                params,
+            )
+            results.append(f"Entry #{entry_id} updated.")
+    return results
+
+
+@mcp.tool
+def archive(
+    older_than_days: int,
+    status: str = "todo",
+    action: Literal["cancel", "complete"] = "cancel",
+) -> str:
+    """Bulk-cancel or bulk-complete stale entries older than a given number of days.
+
+    Args:
+        older_than_days: Entries whose created_at is older than this many days are targeted.
+        status: Only entries currently in this status are affected (default: 'todo').
+        action: Whether to 'cancel' or 'complete' the matched entries (default: 'cancel').
+    """
+    if older_than_days < 1:
+        return "older_than_days must be at least 1."
+    cutoff = (date.today() - timedelta(days=older_than_days)).isoformat()  # noqa: DTZ011
+    new_status = "cancelled" if action == "cancel" else "done"
+    with db.get_connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE entries
+            SET status = ?, updated_at = datetime('now')
+            WHERE status = ?
+              AND DATE(created_at) < ?
+            """,
+            (new_status, status, cutoff),
+        )
+    count = cursor.rowcount
+    verb = "cancelled" if action == "cancel" else "completed"
+    return f"Archived (marked as {verb}) {count} entr{'y' if count == 1 else 'ies'} older than {older_than_days} days with status '{status}'."  # noqa: E501
 
 
 @mcp.tool
