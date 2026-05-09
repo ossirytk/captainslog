@@ -113,6 +113,7 @@ def capture(  # noqa: PLR0913
         )
         entry_id = cursor.lastrowid
         if depends_on:
+            depends_on = list(dict.fromkeys(d for d in depends_on if isinstance(d, int)))
             placeholders = ",".join("?" * len(depends_on))
             valid_ids = {
                 row[0]
@@ -160,23 +161,25 @@ def agenda(target_date: str = "") -> list[dict]:
             """,
             {"today": today},
         ).fetchall()
+        entry_ids = [row["id"] for row in rows]
+        blocked_by_map: dict[int, list[int]] = {}
+        if entry_ids:
+            id_placeholders = ",".join("?" * len(entry_ids))
+            for dr in conn.execute(
+                f"""
+                SELECT d.entry_id, d.depends_on_id
+                FROM entry_deps d
+                JOIN entries e ON e.id = d.depends_on_id
+                WHERE d.entry_id IN ({id_placeholders})
+                  AND e.status NOT IN ('done', 'cancelled')
+                """,  # noqa: S608
+                entry_ids,
+            ).fetchall():
+                blocked_by_map.setdefault(dr[0], []).append(dr[1])
         result = []
         for row in rows:
             entry = dict(row)
-            blocked_by = [
-                r[0]
-                for r in conn.execute(
-                    """
-                    SELECT d.depends_on_id
-                    FROM entry_deps d
-                    JOIN entries e ON e.id = d.depends_on_id
-                    WHERE d.entry_id = ?
-                      AND e.status NOT IN ('done', 'cancelled')
-                    """,
-                    (entry["id"],),
-                ).fetchall()
-            ]
-            entry["blocked_by"] = blocked_by
+            entry["blocked_by"] = blocked_by_map.get(entry["id"], [])
             result.append(entry)
     return result
 
@@ -293,29 +296,31 @@ def list_entries(  # noqa: PLR0913
 
     with db.get_connection() as conn:
         rows = conn.execute(query, params).fetchall()
+        entry_ids = [row["id"] for row in rows]
+        blocked_by_map: dict[int, list[int]] = {}
+        if entry_ids:
+            id_placeholders = ",".join("?" * len(entry_ids))
+            for dr in conn.execute(
+                f"""
+                SELECT d.entry_id, d.depends_on_id
+                FROM entry_deps d
+                JOIN entries e ON e.id = d.depends_on_id
+                WHERE d.entry_id IN ({id_placeholders})
+                  AND e.status NOT IN ('done', 'cancelled')
+                """,  # noqa: S608
+                entry_ids,
+            ).fetchall():
+                blocked_by_map.setdefault(dr[0], []).append(dr[1])
         result = []
         for row in rows:
             entry = dict(row)
-            blocked_by = [
-                r[0]
-                for r in conn.execute(
-                    """
-                    SELECT d.depends_on_id
-                    FROM entry_deps d
-                    JOIN entries e ON e.id = d.depends_on_id
-                    WHERE d.entry_id = ?
-                      AND e.status NOT IN ('done', 'cancelled')
-                    """,
-                    (entry["id"],),
-                ).fetchall()
-            ]
-            entry["blocked_by"] = blocked_by
+            entry["blocked_by"] = blocked_by_map.get(entry["id"], [])
             result.append(entry)
     return result
 
 
 @mcp.tool
-def update_entry(  # noqa: PLR0913, PLR0912
+def update_entry(  # noqa: PLR0913, PLR0912, PLR0915
     entry_id: int,
     title: str | None = None,
     body: str | None = None,
@@ -387,16 +392,10 @@ def update_entry(  # noqa: PLR0913, PLR0912
         if not fields and not dep_change:
             return "No fields to update — provide at least one update or clear_* flag."
 
-        if fields:
-            fields.append("updated_at = datetime('now')")
-            params.append(entry_id)
-            conn.execute(
-                f"UPDATE entries SET {', '.join(fields)} WHERE id = ?",  # noqa: S608
-                params,
-            )
-
-        if clear_depends_on or depends_on is not None:
-            conn.execute("DELETE FROM entry_deps WHERE entry_id = ?", (entry_id,))
+        # Validate and prepare dep IDs before touching the database.
+        dep_ids: list[int] = []
+        if depends_on is not None:
+            depends_on = list(dict.fromkeys(d for d in depends_on if isinstance(d, int)))
             if depends_on:
                 placeholders = ",".join("?" * len(depends_on))
                 valid_ids = {
@@ -408,13 +407,29 @@ def update_entry(  # noqa: PLR0913, PLR0912
                 }
                 invalid_ids = sorted(set(depends_on) - valid_ids - {entry_id})
                 if invalid_ids:
-                    return f"Entry #{entry_id} updated. Invalid depends_on IDs (not set): {invalid_ids}."
+                    return f"Invalid depends_on IDs: {invalid_ids}. Entry #{entry_id} not updated."
                 dep_ids = [d for d in depends_on if d != entry_id]
-                if dep_ids:
-                    conn.executemany(
-                        "INSERT INTO entry_deps (entry_id, depends_on_id) VALUES (?, ?)",
-                        [(entry_id, dep_id) for dep_id in dep_ids],
-                    )
+
+        if fields:
+            fields.append("updated_at = datetime('now')")
+            params.append(entry_id)
+            conn.execute(
+                f"UPDATE entries SET {', '.join(fields)} WHERE id = ?",  # noqa: S608
+                params,
+            )
+
+        if dep_change:
+            if not fields:
+                conn.execute(
+                    "UPDATE entries SET updated_at = datetime('now') WHERE id = ?",
+                    (entry_id,),
+                )
+            conn.execute("DELETE FROM entry_deps WHERE entry_id = ?", (entry_id,))
+            if dep_ids:
+                conn.executemany(
+                    "INSERT INTO entry_deps (entry_id, depends_on_id) VALUES (?, ?)",
+                    [(entry_id, dep_id) for dep_id in dep_ids],
+                )
 
     return f"Entry #{entry_id} updated."
 
@@ -748,8 +763,9 @@ def complete_many(entry_ids: list[int]) -> list[str]:
 def update_many(entries: list[dict]) -> list[str]:  # noqa: PLR0912, PLR0915
     """Update fields on multiple existing entries in a single operation.
 
-    Each entry dict must have at least an 'entry_id' key. All other fields are
-    optional and follow the same semantics as update_entry.
+    Each entry dict must have at least an 'entry_id' key plus at least one field
+    to update. Dependency management (depends_on, clear_depends_on) is not supported
+    here — use update_entry for that.
 
     Args:
         entries: List of dicts. Each must have 'entry_id' (int) plus any subset of:
