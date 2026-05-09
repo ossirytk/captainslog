@@ -113,10 +113,23 @@ def capture(  # noqa: PLR0913
         )
         entry_id = cursor.lastrowid
         if depends_on:
-            conn.executemany(
-                "INSERT OR IGNORE INTO entry_deps (entry_id, depends_on_id) VALUES (?, ?)",
-                [(entry_id, dep_id) for dep_id in depends_on],
-            )
+            placeholders = ",".join("?" * len(depends_on))
+            valid_ids = {
+                row[0]
+                for row in conn.execute(
+                    f"SELECT id FROM entries WHERE id IN ({placeholders})",  # noqa: S608
+                    depends_on,
+                ).fetchall()
+            }
+            invalid_ids = sorted(set(depends_on) - valid_ids - {entry_id})
+            if invalid_ids:
+                return f"Entry #{entry_id} created. Invalid depends_on IDs (not set): {invalid_ids}."
+            dep_ids = [d for d in depends_on if d != entry_id]
+            if dep_ids:
+                conn.executemany(
+                    "INSERT INTO entry_deps (entry_id, depends_on_id) VALUES (?, ?)",
+                    [(entry_id, dep_id) for dep_id in dep_ids],
+                )
     return f"Logged entry #{entry_id}: {title!r}"
 
 
@@ -385,10 +398,23 @@ def update_entry(  # noqa: PLR0913, PLR0912
         if clear_depends_on or depends_on is not None:
             conn.execute("DELETE FROM entry_deps WHERE entry_id = ?", (entry_id,))
             if depends_on:
-                conn.executemany(
-                    "INSERT OR IGNORE INTO entry_deps (entry_id, depends_on_id) VALUES (?, ?)",
-                    [(entry_id, dep_id) for dep_id in depends_on],
-                )
+                placeholders = ",".join("?" * len(depends_on))
+                valid_ids = {
+                    row[0]
+                    for row in conn.execute(
+                        f"SELECT id FROM entries WHERE id IN ({placeholders})",  # noqa: S608
+                        depends_on,
+                    ).fetchall()
+                }
+                invalid_ids = sorted(set(depends_on) - valid_ids - {entry_id})
+                if invalid_ids:
+                    return f"Entry #{entry_id} updated. Invalid depends_on IDs (not set): {invalid_ids}."
+                dep_ids = [d for d in depends_on if d != entry_id]
+                if dep_ids:
+                    conn.executemany(
+                        "INSERT INTO entry_deps (entry_id, depends_on_id) VALUES (?, ?)",
+                        [(entry_id, dep_id) for dep_id in dep_ids],
+                    )
 
     return f"Entry #{entry_id} updated."
 
@@ -443,7 +469,7 @@ def search(query: str, limit: int = 20) -> list[dict]:
                 raise
         else:
             rows = []
-        if not rows:
+        if not db.FTS5_AVAILABLE:
             pattern = f"%{query}%"
             rows = conn.execute(
                 """

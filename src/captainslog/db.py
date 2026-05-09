@@ -31,7 +31,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
             CREATE TABLE entry_deps (
                 entry_id      INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
                 depends_on_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
-                PRIMARY KEY (entry_id, depends_on_id)
+                PRIMARY KEY (entry_id, depends_on_id),
+                CHECK (entry_id != depends_on_id)
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_entry_deps_entry ON entry_deps(entry_id)")
