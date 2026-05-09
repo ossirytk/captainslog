@@ -106,7 +106,11 @@ def _validate_and_dedupe_depends_on(
 
 
 def _fetch_blocked_by_map(conn: sqlite3.Connection, entry_ids: list[int]) -> dict[int, list[int]]:
-    """Return a mapping of entry_id → list of active blocker IDs for a batch of entries."""
+    """Return a mapping of entry_id → list of dependency IDs that are still incomplete.
+
+    A dependency is considered incomplete (i.e. blocking) when its status is neither
+    'done' nor 'cancelled'. Only entries whose IDs appear in ``entry_ids`` are looked up.
+    """
     if not entry_ids:
         return {}
     id_placeholders = ",".join("?" * len(entry_ids))
