@@ -5,7 +5,10 @@ description = "Personal task capture and agenda MCP server"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "fastmcp>=3.1.1",
+    "authlib>=1.6.11",
+    "cryptography>=46.0.7",
+    "fastmcp>=3.2.0",
+    "python-multipart>=0.0.27",
 ]
 
 [project.scripts]
@@ -13,8 +16,9 @@ captainslog = "captainslog.server:run"
 
 [dependency-groups]
 dev = [
-    "pytest>=9.0.2",
+    "pytest>=9.0.3",
     "pytest-cov>=6.0.0",
+    "pip-audit>=2.0.0",
     "ruff>=0.9.0",
 ]
 
@@ -101,4 +105,3 @@ omit = ["tests/*", "*/__pycache__/*"]
 [tool.coverage.report]
 skip_empty = true
 show_missing = true
-
